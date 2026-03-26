@@ -19,12 +19,12 @@ import random
 import numpy as np
 
 NUM_REGIONS=8
-NUM_FAMILY = 6
+NUM_FAMILY = 4
 ALPHA_DEFAULT=1.0
 ALPHA_TRUE=1.5
 # 常量定义，避免在循环里计算
 # 66 个 double，每个 8 字节，总计 528 字节
-FEATURE_BYTES_LEN = (2 + 16 * 4) * 8
+FEATURE_BYTES_LEN = (3 + 16 * 4) * 8
 
 
 
@@ -68,7 +68,7 @@ class HierarchicalBandit:
     def __init__(self, num_regions=16, num_families=6, alpha=ALPHA_DEFAULT):
         # 定义特征维度
         self.dim_region_feat = 4   # 局部特征维度
-        self.dim_global_feat = 2   # 全局特征维度
+        self.dim_global_feat = 3   # 全局特征维度
         self.dim_combined = self.dim_region_feat + self.dim_global_feat  # 联合特征维度
         
         # 大脑 1：Region 选择器 (16 个 Arm，每个 Arm 看 4 维特征)
@@ -221,11 +221,11 @@ def read_features_from_shm() -> tuple:
     
     # 3. 切片提取：前 2 个元素是全局特征
     # .astype(np.float32) 是为了转成 32 位浮点数，加速后续 LinUCB 的矩阵相乘
-    global_ctx = data_array[0:2].astype(np.float32)
+    global_ctx = data_array[0:3].astype(np.float32)
     
     # 4. 切片并重塑：后 64 个元素是 16 个 Region 的特征
     # 直接 reshape 成 (16, 4) 的二维矩阵
-    regions_matrix = data_array[2:].reshape(16, 4).astype(np.float32)
+    regions_matrix = data_array[3:].reshape(16, 4).astype(np.float32)
     
     # 将矩阵转为 list 
     regions_ctx_list = [regions_matrix[i, :] for i in range(16)]
@@ -239,7 +239,7 @@ def read_reward_from_shm(c2py_map) -> float:
     假设 Reward 放在特征数据之后（偏移量 528 处）。
     """
     # 16*4*8 + 2*8 = 528
-    REWARD_OFFSET = 528 
+    REWARD_OFFSET = 536
     
     c2py_map.seek(REWARD_OFFSET)
     # 读取 8 字节并解析为双精度浮点数 (double)
