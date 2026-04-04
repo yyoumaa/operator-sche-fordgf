@@ -23,7 +23,7 @@ NUM_FAMILY = 5
 ALPHA_DEFAULT=1.0
 ALPHA_TRUE=1.5
 # 常量定义，避免在循环里计算
-# 66 个 double，每个 8 字节，总计 528 字节
+# 66 个 double，每个 8 字节，总计 536 字节
 FEATURE_BYTES_LEN = (3 + 16 * 4) * 8
 
 
@@ -40,138 +40,126 @@ logging.basicConfig(
 )
 logging.info("Python程序启动")
 
-
-class LinUCBArm:
-    def __init__(self, d: int, alpha: float = ALPHA_DEFAULT):
-        self.d = d                             # 上下文特征的维度
-        self.alpha = alpha                     # 探索权重参数
-        self.A = np.identity(d)                # d x d 矩阵
-        self.b = np.zeros(d)                   # d 维向量
-        self.A_inv = np.identity(d)
-
-    def get_ucb(self, context: np.ndarray) -> float:
-        # context 必须是 shape 为 (d,) 的 numpy 数组
-        theta = self.A_inv.dot(self.b)         # 估计参数 theta 
-        expected_reward = theta.dot(context)
-        uncertainty = self.alpha * np.sqrt(context.dot(self.A_inv).dot(context))
-        return expected_reward + uncertainty
-
-    def update(self, context: np.ndarray, reward: float):
-        # 严格执行: 遇到 reward 联合更新矩阵 
-        self.A += np.outer(context, context)
-        self.b += reward * context
-        self.A_inv = np.linalg.inv(self.A)
-
-
-
-class HierarchicalBandit:
-    def __init__(self, num_regions=16, num_families=5, alpha=ALPHA_DEFAULT):
-        # 定义特征维度
-        self.dim_region_feat = 4   # 局部特征维度
-        self.dim_global_feat = 3   # 全局特征维度
-        self.dim_combined = self.dim_region_feat + self.dim_global_feat  # 联合特征维度
+class PolicyGradientScheduler:
+    def __init__(self, num_regions=16, num_families=5, lr=0.005, 
+                 baseline_alpha=0.1, temperature=1.0):
+        self.num_regions = num_regions
+        self.num_families = num_families
+        self.lr = lr
+        self.baseline_alpha = baseline_alpha  # EMA衰减系数
+        self.temperature = temperature         # softmax温度，越大越均匀，越小越集中
         
-        # 大脑 1：Region 选择器 (16 个 Arm，每个 Arm 看 4 维特征)
-        # 创建一个list，里面每一项都是一个a区域的rm，不同arm之间不共享参数
-        self.region_arms = [LinUCBArm(d=self.dim_region_feat, alpha=alpha) for _ in range(num_regions)]
-        
-        # 大脑 2：算子族选择器 (6 个 Arm，每个 Arm 看 6 维特征)
-        self.family_arms = [LinUCBArm(d=self.dim_combined, alpha=alpha) for _ in range(num_families)]
+        self.dim_local = 4    # 局部特征维度
+        self.dim_global = 3   # 全局特征维度
+        self.dim_combined = self.dim_local + self.dim_global  # 7维
 
-    def get_action(self, global_context: np.ndarray, regions_context_list: list):
+        # W_reg: shape (7,) 一个共享的权重向量，对所有region打分
+        # 物理含义：学"什么特征的region更好"，而不是"第几号region更好"
+        self.W_reg = np.zeros(self.dim_combined)
+        
+        # W_fam: shape (5, 7) 每个family一行，学"什么特征的region适合这个family"
+        self.W_fam = np.zeros((num_families, self.dim_combined))
+        
+        # EMA baseline，用于方差缩减
+        self.baseline = 0.0
+        self.update_count = 0
+
+    def _softmax(self, logits):
+        logits = logits / self.temperature
+        logits = logits - np.max(logits)  # 数值稳定
+        exp_logits = np.exp(logits)
+        return exp_logits / (np.sum(exp_logits) + 1e-12)
+
+    def get_distributions(self, global_ctx, regions_ctx_list):
         """
-        前向选择：先选哪块地 (Region)，再选哪把工具 (Family)
-        :param global_context: shape 为 (2,) 的 np array
-        :param regions_context_list: 包含 16 个元素的 list，每个元素是 shape 为 (4,) 的 np array
+        返回：
+        P_reg: shape (16,)    每个region被选中的概率
+        P_fam: shape (16, 5)  每个region下各family的概率
+        valid_mask: shape (16,) 哪些region是有效的
         """
-        # ==========================================
-        # 步骤 1: 大脑 1 选拔潜力最大的 Region
-        # 跳过“全 0 特征”的无效区域
-        # ==========================================
-        best_region_idx = -1
-        max_region_ucb = -float('inf')
+        region_scores = np.full(self.num_regions, -1e9)
+        valid_mask = np.zeros(self.num_regions, dtype=bool)
+        x_all = []  # 每个region的特征向量，用于梯度计算
 
-        valid_region_indices = [
-            idx for idx, ctx in enumerate(regions_context_list)
-            if not np.all(np.abs(ctx) < 1e-12)
-        ]
-        logging.info(f"[PY][VALID_REGIONS] valid={valid_region_indices}"
-            f"global={global_context.tolist()}"
-        )
-        
-        for idx, arm in enumerate(self.region_arms):
-            region_ctx = regions_context_list[idx]
-
-             # 如果四维特征全是 0，视为无效 region，直接跳过
+        for i, region_ctx in enumerate(regions_ctx_list):
             if np.all(np.abs(region_ctx) < 1e-12):
+                x_all.append(None)
                 continue
+            x_i = np.concatenate([global_ctx, region_ctx])
+            x_all.append(x_i)
+            region_scores[i] = np.dot(self.W_reg, x_i)
+            valid_mask[i] = True
 
-            ucb_val = arm.get_ucb(region_ctx)
-            if ucb_val > max_region_ucb:
-                max_region_ucb = ucb_val
-                best_region_idx = idx
-        
-         # 兜底：如果全都被跳过，就默认选第 0 个 region
-        if best_region_idx == -1:
-            best_region_idx = 0
-                
-        # 保存选中的局部特征，作为下一步的垫脚石
-        selected_region_context = regions_context_list[best_region_idx]
+        P_reg = self._softmax(region_scores)
+        # 把无效region的概率清零并重新归一化
+        P_reg = P_reg * valid_mask
+        total = P_reg.sum()
+        if total > 1e-12:
+            P_reg = P_reg / total
+        else:
+            # 兜底：均匀分配给有效region
+            n_valid = valid_mask.sum()
+            P_reg = valid_mask.astype(float) / max(n_valid, 1)
 
-        # ==========================================
-        # 步骤 2: 上下文单向传递与特征拼接
-        # ==========================================
-        # 大脑 2 踩在大脑 1 的肩膀上，拼接出 5 维联合特征
-        combined_context = np.concatenate((selected_region_context, global_context))
+        P_fam = np.zeros((self.num_regions, self.num_families))
+        for i in range(self.num_regions):
+            if not valid_mask[i] or x_all[i] is None:
+                P_fam[i] = np.ones(self.num_families) / self.num_families
+            else:
+                family_logits = self.W_fam.dot(x_all[i])  # shape (5,)
+                P_fam[i] = self._softmax(family_logits)
 
-        # ==========================================
-        # 步骤 3: 大脑 2 选拔最合适的 Operator Family
-        # ==========================================
-        best_family_idx = -1
-        max_family_ucb = -float('inf')
-        
-        for idx, arm in enumerate(self.family_arms):
-            ucb_val = arm.get_ucb(combined_context)
-            if ucb_val > max_family_ucb:
-                max_family_ucb = ucb_val
-                best_family_idx = idx
+        return P_reg, P_fam, valid_mask, x_all
 
-        # 返回决策结果，并附带本次决策使用的 Context (用于后续 Update)
-        return best_region_idx, best_family_idx, selected_region_context, combined_context
-
-    def update(self, region_idx: int, family_idx: int, 
-               region_context: np.ndarray, combined_context: np.ndarray, 
-               reward: float):
+    def update(self, best_region, best_family, global_ctx, 
+               regions_ctx_list, reward):
         """
-        后向更新：共享同一份工资 (Reward) 强绑定
+        用C侧反馈的"最佳(region, family)"做REINFORCE更新。
+        best_region, best_family: C侧batch中产生最高reward的那对动作
+        reward: 这次batch的max_reward
         """
-        # 大脑 1 拿工资：更新选中的那块地的评价
-        self.region_arms[region_idx].update(region_context, reward)
-        
-        # 大脑 2 拿同样一份工资：更新在这块地里用这把工具的评价
-        self.family_arms[family_idx].update(combined_context, reward)
+        # 更新EMA baseline
+        self.baseline = ((1 - self.baseline_alpha) * self.baseline 
+                         + self.baseline_alpha * reward)
+        advantage = reward - self.baseline
+        self.update_count += 1
 
-    # def update(self, region_idx: int, family_idx: int, 
-    #            region_context: np.ndarray, combined_context: np.ndarray, 
-    #            reward: float):
-    #     """
-    #     非对称更新机制：
-    #     Family 承担所有责任，Region 获得失败保护。
-    #     """
-    #     # 大脑 2 (算子族)：无论好坏，严格吃下真实 Reward
-    #     self.family_arms[family_idx].update(combined_context, reward)
-        
-    #     # 大脑 1 (区域)：如果失败了（reward很小或为0），给区域一个“免死金牌”或者“衰减惩罚”
-    #     region_reward = reward
-    #     if reward <= 0.0:
-    #         # 宽容模式：这里有几种处理方式，最简单的是给一个微小的常数垫底
-    #         # 或者根本不更新 Region 的惩罚（即跳过 update，只让它增加探索度）
-    #         # 这里推荐给一个衰减系数，假装它拿到了一点点保底分数，减缓权重下降
-    #         region_reward = -0.01 # 或者 0.0，视你的 reward baseline 而定
-    #         # 如果你的 LinUCB 没有严格负数惩罚，你可以直接让 reward = 0 时的 update 权重变小
-        
-    #     self.region_arms[region_idx].update(region_context, region_reward)
+        logging.info(f"[PY][UPDATE] reward={reward:.4f} baseline={self.baseline:.4f} "
+                     f"advantage={advantage:.4f} best_r={best_region} best_f={best_family}")
 
+        if abs(advantage) < 1e-9:
+            return  # 和baseline持平，不更新
+
+        # 重新计算当前分布（用于梯度）
+        P_reg, P_fam, valid_mask, x_all = self.get_distributions(
+            global_ctx, regions_ctx_list)
+
+        # ---- 更新 W_reg ----
+        # REINFORCE梯度（权重共享版本）：
+        # grad = x_best_region - E_{p}[x]
+        if valid_mask[best_region] and x_all[best_region] is not None:
+            x_best = x_all[best_region]
+            # 计算在当前策略下的期望特征向量
+            expected_x = np.zeros(self.dim_combined)
+            for i in range(self.num_regions):
+                if valid_mask[i] and x_all[i] is not None:
+                    expected_x += P_reg[i] * x_all[i]
+            grad_W_reg = x_best - expected_x
+            self.W_reg += self.lr * advantage * grad_W_reg
+
+        # ---- 更新 W_fam ----
+        # 对best_region对应的特征做更新
+        if valid_mask[best_region] and x_all[best_region] is not None:
+            x_r = x_all[best_region]
+            p_fam = P_fam[best_region]
+            for f in range(self.num_families):
+                indicator = 1.0 if f == best_family else 0.0
+                grad_f = (indicator - p_fam[f]) * x_r
+                self.W_fam[f] += self.lr * advantage * grad_f
+
+        # 防止权重爆炸，做一个轻量clip
+        self.W_reg = np.clip(self.W_reg, -10.0, 10.0)
+        self.W_fam = np.clip(self.W_fam, -10.0, 10.0)
 
 def init_ipc():
     global shm_c2py, shm_py2c, c2py_map, py2c_map
@@ -183,7 +171,7 @@ def init_ipc():
         c2py_map = mmap.mmap(shm_c2py.fd, 1024) # 足够容纳特征+Reward
 
         shm_py2c = posix_ipc.SharedMemory("/shm_py2c")
-        py2c_map = mmap.mmap(shm_py2c.fd, 128)  # 足够容纳决策
+        py2c_map = mmap.mmap(shm_py2c.fd, 1024)  # 足够容纳决策
 
         # 三个核心信号量
         sem_c_done_features = posix_ipc.Semaphore("/sem_c_feat")
@@ -219,23 +207,20 @@ def wait_for_afl_features():
         pass
 
 
-def write_decision_to_shm(py2c_map, region_id: int, family_id: int):
+def write_decision_to_shm(py2c_map, P_reg: np.ndarray, P_fam: np.ndarray):
     """
-    将决策结果以二进制形式写入共享内存。
-    格式：2 个连续的 4 字节整数 (Little-endian int)
-    总计：8 字节
+    将概率分布写入共享内存。
+    格式：P_reg (16个double) + P_fam (16*5=80个double)
+    总计：96个double = 768字节
     """
-    # 'ii' 表示两个 int，'<' 表示小端序（兼容大多数 Linux/X86 环境）
-    binary_data = struct.pack('<ii', region_id, family_id)
-    
-    # 回到起始位置并写入
     py2c_map.seek(0)
-    py2c_map.write(binary_data)
-    
-    # 刷新映射，确保 C 语言侧能立刻看到更新（在某些系统上 mmap 需要 flush）
+    # P_reg: 16个float64
+    py2c_map.write(P_reg.astype('<f8').tobytes())
+    # P_fam: 80个float64（按行展平）
+    py2c_map.write(P_fam.astype('<f8').flatten().tobytes())
     py2c_map.flush()
-    
-    logging.info(f"Python sent decision: Region {region_id}, Family {family_id}")
+
+    logging.info(f"[PY][SEND] P_reg={np.round(P_reg,3).tolist()}")
 
     
 
@@ -272,60 +257,60 @@ def read_features_from_shm() -> tuple:
     return global_ctx, regions_ctx_list
 
 
-def read_reward_from_shm(c2py_map) -> float:
+def read_reward_and_best_action(c2py_map):
     """
-    从共享内存的固定偏移量处读取本次 Batch 的 Reward。
-    假设 Reward 放在特征数据之后（偏移量 528 处）。
+    从共享内存读取：
+    - reward (1个double，偏移536)
+    - best_region (1个int，偏移544)
+    - best_family (1个int，偏移548)
     """
-    # 16*4*8 + 2*8 = 528
     REWARD_OFFSET = 536
-    
     c2py_map.seek(REWARD_OFFSET)
-    # 读取 8 字节并解析为双精度浮点数 (double)
-    raw_reward = c2py_map.read(8)
-    reward = struct.unpack('<d', raw_reward)[0]
-    
-    return float(reward)
+    reward = struct.unpack('<d', c2py_map.read(8))[0]
+    best_region = struct.unpack('<i', c2py_map.read(4))[0]
+    best_family = struct.unpack('<i', c2py_map.read(4))[0]
+
+    return float(reward), int(best_region), int(best_family)
 
 
 def main():
     global c2py_map, py2c_map
     init_ipc()
-     # 1. 全局初始化 (只执行一次)
-    bandit_manager = HierarchicalBandit(num_regions=16, num_families=5, alpha=ALPHA_TRUE)
-    logging.info(f"===== 重新启动了！当前的大脑里，总共有 {len(bandit_manager.family_arms)} 个算子族 =====")
+    
+    scheduler = PolicyGradientScheduler(
+        num_regions=16, num_families=5,
+        lr=0.005, baseline_alpha=0.1, temperature=1.0
+    )
+    logging.info("===== PolicyGradient Scheduler 启动 =====")
 
-    # --- 不断接收 AFL 的请求 ---
+
     while True:
-        ## 等待 C 算完特征
         wait_for_afl_features()
+        global_ctx, regions_ctx_list = read_features_from_shm()
 
-        # 2. 从共享内存解析出特征
-        global_ctx,regions_ctx_list = read_features_from_shm()        # 例如: np.array([0.8, -0.2])以及 长度 16 的 list
-             
-        # 3. 联合决策
-        # 注意：我们要把做决策时用的 context 存下来，因为 C 语言跑完一个 Batch 之后，
-        # 环境可能变化了，更新时必须用“当时做决策的 Context”。
-        region_id, family_id, used_reg_ctx, used_comb_ctx = bandit_manager.get_action(global_ctx, regions_ctx_list)
+        # 生成概率分布
+        P_reg, P_fam, valid_mask, _ = scheduler.get_distributions(
+            global_ctx, regions_ctx_list)
 
-        # 4. 把决策写回共享内存，放行 C 语言去跑 Fuzzing Batch
-        write_decision_to_shm(py2c_map, region_id, family_id)
+        # 发给C侧
+        write_decision_to_shm(py2c_map, P_reg, P_fam)
         wake_up_afl()
- 
-        # 5. 等待 C 语言跑完这n次，拿回最高/平均/... Reward 
+
+        # 等待batch结束
         wait_for_afl_finish_batch()
-        
-        batch_reward = read_reward_from_shm(c2py_map)
+        reward, best_region, best_family = read_reward_and_best_action(c2py_map)
 
-        # 6. 强绑定联合更新
-        bandit_manager.update(region_idx=region_id, 
-                            family_idx=family_id, 
-                            region_context=used_reg_ctx, 
-                            combined_context=used_comb_ctx, 
-                            reward=batch_reward)
+        logging.info(f"[PY][BATCH_DONE] reward={reward:.4f} "
+                     f"best_r={best_region} best_f={best_family}")
 
+        # 用这次的特征和C反馈的最佳动作做更新
+        scheduler.update(
+            best_region=best_region,
+            best_family=best_family,
+            global_ctx=global_ctx,
+            regions_ctx_list=regions_ctx_list,
+            reward=reward
+        )
 
-  
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
