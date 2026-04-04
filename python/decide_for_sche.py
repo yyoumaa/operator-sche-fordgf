@@ -18,8 +18,8 @@ from typing import List
 import random
 import numpy as np
 
-NUM_REGIONS=8
-NUM_FAMILY = 4
+NUM_REGIONS=16
+NUM_FAMILY = 5
 ALPHA_DEFAULT=1.0
 ALPHA_TRUE=1.5
 # 常量定义，避免在循环里计算
@@ -65,7 +65,7 @@ class LinUCBArm:
 
 
 class HierarchicalBandit:
-    def __init__(self, num_regions=16, num_families=6, alpha=ALPHA_DEFAULT):
+    def __init__(self, num_regions=16, num_families=5, alpha=ALPHA_DEFAULT):
         # 定义特征维度
         self.dim_region_feat = 4   # 局部特征维度
         self.dim_global_feat = 3   # 全局特征维度
@@ -86,16 +86,34 @@ class HierarchicalBandit:
         """
         # ==========================================
         # 步骤 1: 大脑 1 选拔潜力最大的 Region
+        # 跳过“全 0 特征”的无效区域
         # ==========================================
         best_region_idx = -1
         max_region_ucb = -float('inf')
+
+        valid_region_indices = [
+            idx for idx, ctx in enumerate(regions_context_list)
+            if not np.all(np.abs(ctx) < 1e-12)
+        ]
+        logging.info(f"[PY][VALID_REGIONS] valid={valid_region_indices}"
+            f"global={global_context.tolist()}"
+        )
         
         for idx, arm in enumerate(self.region_arms):
             region_ctx = regions_context_list[idx]
+
+             # 如果四维特征全是 0，视为无效 region，直接跳过
+            if np.all(np.abs(region_ctx) < 1e-12):
+                continue
+
             ucb_val = arm.get_ucb(region_ctx)
             if ucb_val > max_region_ucb:
                 max_region_ucb = ucb_val
                 best_region_idx = idx
+        
+         # 兜底：如果全都被跳过，就默认选第 0 个 region
+        if best_region_idx == -1:
+            best_region_idx = 0
                 
         # 保存选中的局部特征，作为下一步的垫脚石
         selected_region_context = regions_context_list[best_region_idx]
@@ -132,6 +150,27 @@ class HierarchicalBandit:
         
         # 大脑 2 拿同样一份工资：更新在这块地里用这把工具的评价
         self.family_arms[family_idx].update(combined_context, reward)
+
+    # def update(self, region_idx: int, family_idx: int, 
+    #            region_context: np.ndarray, combined_context: np.ndarray, 
+    #            reward: float):
+    #     """
+    #     非对称更新机制：
+    #     Family 承担所有责任，Region 获得失败保护。
+    #     """
+    #     # 大脑 2 (算子族)：无论好坏，严格吃下真实 Reward
+    #     self.family_arms[family_idx].update(combined_context, reward)
+        
+    #     # 大脑 1 (区域)：如果失败了（reward很小或为0），给区域一个“免死金牌”或者“衰减惩罚”
+    #     region_reward = reward
+    #     if reward <= 0.0:
+    #         # 宽容模式：这里有几种处理方式，最简单的是给一个微小的常数垫底
+    #         # 或者根本不更新 Region 的惩罚（即跳过 update，只让它增加探索度）
+    #         # 这里推荐给一个衰减系数，假装它拿到了一点点保底分数，减缓权重下降
+    #         region_reward = -0.01 # 或者 0.0，视你的 reward baseline 而定
+    #         # 如果你的 LinUCB 没有严格负数惩罚，你可以直接让 reward = 0 时的 update 权重变小
+        
+    #     self.region_arms[region_idx].update(region_context, region_reward)
 
 
 def init_ipc():
@@ -253,7 +292,8 @@ def main():
     global c2py_map, py2c_map
     init_ipc()
      # 1. 全局初始化 (只执行一次)
-    bandit_manager = HierarchicalBandit(num_regions=16, num_families=6, alpha=ALPHA_TRUE)
+    bandit_manager = HierarchicalBandit(num_regions=16, num_families=5, alpha=ALPHA_TRUE)
+    logging.info(f"===== 重新启动了！当前的大脑里，总共有 {len(bandit_manager.family_arms)} 个算子族 =====")
 
     # --- 不断接收 AFL 的请求 ---
     while True:
