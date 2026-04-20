@@ -11,7 +11,7 @@ import os
 import sys
 import mmap
 import posix_ipc
-import logging,time
+import logging,time5
 import struct
 from dataclasses import dataclass, field
 from typing import List
@@ -36,13 +36,14 @@ py2c_map = None
 logging.basicConfig(
     filename="/operator-sche-fordgf.log",
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    filemode='w'  # 加这一行，每次启动覆盖而不是追加
 )
 logging.info("Python程序启动")
 
 class PolicyGradientScheduler:
-    def __init__(self, num_regions=16, num_families=5, lr=0.005, 
-                 baseline_alpha=0.1, temperature=1.0):
+    def __init__(self, num_regions=16, num_families=5, lr=0.02, 
+                 baseline_alpha=0.1, temperature=5.0):
         self.num_regions = num_regions
         self.num_families = num_families
         self.lr = lr
@@ -118,6 +119,11 @@ class PolicyGradientScheduler:
         best_region, best_family: C侧batch中产生最高reward的那对动作
         reward: 这次batch的max_reward
         """
+        # 新增：C侧传-1表示本批没有正收益，跳过更新
+        if best_region == -1 or best_family == -1:
+            logging.info(f"[PY][UPDATE] 本批无正收益，跳过权重更新")
+            return
+
         # 更新EMA baseline
         self.baseline = ((1 - self.baseline_alpha) * self.baseline 
                          + self.baseline_alpha * reward)
@@ -221,6 +227,9 @@ def write_decision_to_shm(py2c_map, P_reg: np.ndarray, P_fam: np.ndarray):
     py2c_map.flush()
 
     logging.info(f"[PY][SEND] P_reg={np.round(P_reg,3).tolist()}")
+    # 打印概率最高的那个region对应的family分布
+    best_r = int(np.argmax(P_reg))
+    logging.info(f"[PY][SEND] best_r={best_r} P_fam[{best_r}]={np.round(P_fam[best_r],3).tolist()}")
 
     
 
@@ -279,7 +288,7 @@ def main():
     
     scheduler = PolicyGradientScheduler(
         num_regions=16, num_families=5,
-        lr=0.005, baseline_alpha=0.1, temperature=1.0
+        lr=0.005, baseline_alpha=0.1, temperature=3.0
     )
     logging.info("===== PolicyGradient Scheduler 启动 =====")
 
@@ -301,7 +310,8 @@ def main():
         reward, best_region, best_family = read_reward_and_best_action(c2py_map)
 
         logging.info(f"[PY][BATCH_DONE] reward={reward:.4f} "
-                     f"best_r={best_region} best_f={best_family}")
+             f"best_r={best_region} best_f={best_family} "
+             f"{'(no update)' if best_region == -1 else '(will update)'}")
 
         # 用这次的特征和C反馈的最佳动作做更新
         scheduler.update(
