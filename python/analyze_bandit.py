@@ -1,212 +1,121 @@
-import sys
-import re
-import json
-from collections import defaultdict
+"""
+分析 /operator-sche-fordgf/bandit_log.txt (C 侧 bandit 日志)
+逐行流式解析，不全量加载 trials 到内存。
 
-def parse_log(filepath):
-    seeds = []
-    current_seed = None
-    current_trials = []
+适配自适应 region 新格式：
+  - [BANDIT][SEED] len=... num_regions=...
+  - [BANDIT][REGION_FEAT] i=... start=... end=...
 
-    seed_pat    = re.compile(r'\[BANDIT\]\[SEED\] len=(\d+).*?prox=(\d+).*?ema=([\d.]+).*?dynmax=(\d+)')
-    feat_pat    = re.compile(r'\[BANDIT\]\[REGION_FEAT\] i=(\d+).*?hrew=([\d.]+).*?hcov=([\d.]+)')
-    try_pat     = re.compile(r'\[BANDIT\]\[TRY\] trial=(\d+) sampled_r=(\d+) sampled_f=(\d+) op=(\d+) pos=(\d+) len=(\d+) in_region=(\d+) reward=(-?\d+)')
-    batch_pat   = re.compile(r'\[BANDIT\]\[BATCH_END\] best_r=(-?\d+) best_f=(-?\d+) batch_reward=([\d.]+)')
-    sample_pat  = re.compile(r'\[BANDIT\]\[SAMPLE\] trial=(\d+) sampled_r=(\d+) sampled_f=(\d+)')
+提取:
+  - SEED 特征演化 (prox, ema, global features, num_regions)
+  - REGION_FEAT hrew/hcov 积累趋势
+  - region 数变化
+"""
+import sys, re
+import numpy as np
+from collections import Counter
 
-    with open(filepath, 'r') as f:
+
+def entropy(vals):
+    arr = np.array(vals, dtype=np.float64)
+    arr = arr[arr > 1e-12]
+    if len(arr) == 0:
+        return 0.0
+    return float(-np.sum(arr * np.log(arr)))
+
+
+def main(filepath):
+    seed_pat = re.compile(
+        r'\[BANDIT\]\[SEED\] len=(\d+) num_regions=(\d+) prox=(\d+) '
+        r'g0=([\d.]+) g1=([\d.]+) g2=([\d.]+) ema=([\d.]+) dynmax=(\d+)')
+    feat_pat = re.compile(
+        r'\[BANDIT\]\[REGION_FEAT\] i=(\d+) start=(\d+) end=(\d+) '
+        r'ent=([\d.]+) pr=([\d.]+) hrew=([\d.]+) hcov=([\d.]+)')
+
+    num_seeds = 0
+    seed_snapshots = []
+    cur_hrew = []
+    current_num_regions = None
+    hrew_spread = []
+    num_region_hist = Counter()
+
+    with open(filepath) as f:
         for line in f:
             m = seed_pat.search(line)
             if m:
-                if current_seed is not None:
-                    current_seed['trials'] = current_trials
-                    seeds.append(current_seed)
-                current_seed = {
+                if cur_hrew and current_num_regions is not None:
+                    vals = cur_hrew[:current_num_regions]
+                    if vals:
+                        hrew_spread.append({
+                            'num_regions': current_num_regions,
+                            'max': max(vals),
+                            'min': min(vals),
+                            'spread': max(vals) - min(vals),
+                            'entropy': entropy(np.array(vals) / max(np.sum(vals), 1e-12)),
+                        })
+                num_seeds += 1
+                current_num_regions = int(m.group(2))
+                cur_hrew = [0.5] * current_num_regions
+                num_region_hist[current_num_regions] += 1
+                seed_snapshots.append({
                     'len': int(m.group(1)),
-                    'prox': int(m.group(2)),
-                    'ema': float(m.group(3)),
-                    'dynmax': int(m.group(4)),
-                    'hrew': [0.0] * 16,
-                    'hcov': [0.0] * 16,
-                    'trials': [],
-                    'best_r': -1,
-                    'best_f': -1,
-                    'batch_reward': 0.0,
-                }
-                current_trials = []
-                continue
-
-            if current_seed is None:
-                continue
-
-            m = feat_pat.search(line)
-            if m:
-                i = int(m.group(1))
-                current_seed['hrew'][i] = float(m.group(2))
-                current_seed['hcov'][i] = float(m.group(3))
-                continue
-
-            m = try_pat.search(line)
-            if m:
-                current_trials.append({
-                    'trial': int(m.group(1)),
-                    'sampled_r': int(m.group(2)),
-                    'sampled_f': int(m.group(3)),
-                    'op': int(m.group(4)),
-                    'pos': int(m.group(5)),
-                    'len': int(m.group(6)),
-                    'in_region': int(m.group(7)),
-                    'reward': int(m.group(8)),
+                    'num_regions': current_num_regions,
+                    'prox': int(m.group(3)),
+                    'g0': float(m.group(4)),
+                    'g1': float(m.group(5)),
+                    'g2': float(m.group(6)),
+                    'ema': float(m.group(7)),
+                    'dynmax': int(m.group(8)),
                 })
                 continue
 
-            m = batch_pat.search(line)
-            if m:
-                current_seed['best_r'] = int(m.group(1))
-                current_seed['best_f'] = int(m.group(2))
-                current_seed['batch_reward'] = float(m.group(3))
+            m = feat_pat.search(line)
+            if m and current_num_regions is not None:
+                i = int(m.group(1))
+                if 0 <= i < current_num_regions:
+                    cur_hrew[i] = float(m.group(6))
                 continue
 
-    if current_seed is not None:
-        current_seed['trials'] = current_trials
-        seeds.append(current_seed)
+    if cur_hrew and current_num_regions is not None:
+        vals = cur_hrew[:current_num_regions]
+        if vals:
+            hrew_spread.append({
+                'num_regions': current_num_regions,
+                'max': max(vals),
+                'min': min(vals),
+                'spread': max(vals) - min(vals),
+                'entropy': entropy(np.array(vals) / max(np.sum(vals), 1e-12)),
+            })
 
-    return seeds
-
-
-def analyze(seeds):
     print(f"\n{'='*60}")
-    print(f"  共解析 {len(seeds)} 个seed批次")
+    print("  C 侧 Bandit Log 分析（自适应 region）")
+    print(f"  总 seed 数: {num_seeds}")
     print(f"{'='*60}")
 
-    # ── 1. 总体reward分布 ──
-    rewards = [s['batch_reward'] for s in seeds]
-    positive = [r for r in rewards if r > 0]
-    print(f"\n【1】Batch Reward 统计")
-    print(f"  有正收益批次: {len(positive)} / {len(seeds)}  ({100*len(positive)/max(len(seeds),1):.1f}%)")
-    if positive:
-        print(f"  正收益均值: {sum(positive)/len(positive):.2f}")
-        print(f"  最大reward: {max(positive):.2f}")
-        print(f"  reward分布: ", end="")
-        buckets = defaultdict(int)
-        for r in positive:
-            b = int(r // 20) * 20
-            buckets[b] += 1
-        for k in sorted(buckets):
-            print(f"[{k}-{k+20}): {buckets[k]}", end="  ")
-        print()
+    if seed_snapshots:
+        print("\n【1】num_regions 分布")
+        for nr in sorted(num_region_hist):
+            cnt = num_region_hist[nr]
+            print(f"  {nr:>2} regions: {cnt:>5} ({100*cnt/len(seed_snapshots):.1f}%)")
 
-    # ── 2. in_region命中率 ──
-    total_trials = 0
-    hit_trials = 0
-    for s in seeds:
-        for t in s['trials']:
-            total_trials += 1
-            if t['in_region'] == 1:
-                hit_trials += 1
-    print(f"\n【2】采样命中率（变异实际落在采样region内）")
-    print(f"  总trial数: {total_trials}")
-    print(f"  in_region=1: {hit_trials}  ({100*hit_trials/max(total_trials,1):.1f}%)")
+        print("\n【2】SEED 特征演化 (采样)")
+        step = max(1, len(seed_snapshots) // 8)
+        print(f"  {'seed#':>7} {'prox':>6} {'ema':>8} {'g0':>8} {'g1':>6} {'g2':>8} {'len':>6} {'regs':>5}")
+        for i in range(0, len(seed_snapshots), step):
+            s = seed_snapshots[i]
+            print(f"  {i:>7} {s['prox']:>6} {s['ema']:>8.4f} {s['g0']:>8.4f} {s['g1']:>6.2f} {s['g2']:>8.5f} {s['len']:>6} {s['num_regions']:>5}")
+        s = seed_snapshots[-1]
+        print(f"  {len(seed_snapshots)-1:>7} {s['prox']:>6} {s['ema']:>8.4f} {s['g0']:>8.4f} {s['g1']:>6.2f} {s['g2']:>8.5f} {s['len']:>6} {s['num_regions']:>5}  (最终)")
 
-    # ── 3. 各region被采样次数 vs 产生正reward次数 ──
-    region_sampled = defaultdict(int)
-    region_pos_reward = defaultdict(int)
-    region_total_reward = defaultdict(float)
-    for s in seeds:
-        for t in s['trials']:
-            r = t['sampled_r']
-            region_sampled[r] += 1
-            if t['reward'] > 0:
-                region_pos_reward[r] += 1
-                region_total_reward[r] += t['reward']
-
-    print(f"\n【3】各Region采样频次 vs 正reward次数")
-    print(f"  {'Region':>8} {'采样次数':>10} {'正reward次':>12} {'命中率%':>10} {'累计reward':>12}")
-    for r in range(16):
-        n = region_sampled[r]
-        p = region_pos_reward[r]
-        rate = 100*p/n if n > 0 else 0
-        total_r = region_total_reward[r]
-        print(f"  {r:>8} {n:>10} {p:>12} {rate:>10.1f} {total_r:>12.1f}")
-
-    # ── 4. 各family被采样次数 vs 正reward次数 ──
-    fam_sampled = defaultdict(int)
-    fam_pos_reward = defaultdict(int)
-    fam_total_reward = defaultdict(float)
-    for s in seeds:
-        for t in s['trials']:
-            f = t['sampled_f']
-            fam_sampled[f] += 1
-            if t['reward'] > 0:
-                fam_pos_reward[f] += 1
-                fam_total_reward[f] += t['reward']
-
-    print(f"\n【4】各Family采样频次 vs 正reward次数")
-    print(f"  {'Family':>8} {'采样次数':>10} {'正reward次':>12} {'命中率%':>10} {'累计reward':>12}")
-    for f in range(5):
-        n = fam_sampled[f]
-        p = fam_pos_reward[f]
-        rate = 100*p/n if n > 0 else 0
-        total_r = fam_total_reward[f]
-        print(f"  {f:>8} {n:>10} {p:>12} {rate:>10.1f} {total_r:>12.1f}")
-
-    # ── 5. 各算子正reward统计 ──
-    op_pos = defaultdict(int)
-    op_total = defaultdict(float)
-    op_count = defaultdict(int)
-    for s in seeds:
-        for t in s['trials']:
-            op = t['op']
-            op_count[op] += 1
-            if t['reward'] > 0:
-                op_pos[op] += 1
-                op_total[op] += t['reward']
-
-    print(f"\n【5】各算子正reward统计（只显示有正收益的）")
-    print(f"  {'Op':>5} {'执行次数':>10} {'正reward次':>12} {'累计reward':>12}")
-    for op in sorted(op_total, key=lambda x: -op_total[x]):
-        print(f"  {op:>5} {op_count[op]:>10} {op_pos[op]:>12} {op_total[op]:>12.1f}")
-
-    # ── 6. hrew分布随时间变化趋势 ──
-    print(f"\n【6】hrew特征积累情况（每50个seed采样一次均值）")
-    step = max(1, len(seeds) // 10)
-    print(f"  {'seed#':>7}", end="")
-    for i in range(16):
-        print(f"  r{i:02d}", end="")
-    print()
-    for idx in range(0, len(seeds), step):
-        s = seeds[idx]
-        print(f"  {idx:>7}", end="")
-        for i in range(16):
-            val = s['hrew'][i]
-            print(f"  {val:.3f}", end="")
-        print()
-
-    # ── 7. 零reward比例随时间变化（学习是否在改善）──
-    print(f"\n【7】每50个batch的正reward比例变化趋势")
-    window = max(1, len(seeds) // 20)
-    for start in range(0, len(seeds), window):
-        chunk = seeds[start:start+window]
-        pos = sum(1 for s in chunk if s['batch_reward'] > 0)
-        bar = '█' * pos + '░' * (len(chunk) - pos)
-        print(f"  [{start:4d}-{start+len(chunk):4d}] {bar}  {pos}/{len(chunk)}")
-
-    # ── 8. 负reward来源分析 ──
-    neg_by_op = defaultdict(int)
-    neg_by_region = defaultdict(int)
-    for s in seeds:
-        for t in s['trials']:
-            if t['reward'] < 0:
-                neg_by_op[t['op']] += 1
-                neg_by_region[t['sampled_r']] += 1
-
-    print(f"\n【8】负reward来源（Top5算子 / Top5 Region）")
-    print("  Top5算子:")
-    for op, cnt in sorted(neg_by_op.items(), key=lambda x: -x[1])[:5]:
-        print(f"    op={op}: {cnt}次")
-    print("  Top5 Region:")
-    for r, cnt in sorted(neg_by_region.items(), key=lambda x: -x[1])[:5]:
-        print(f"    region={r}: {cnt}次")
+    if hrew_spread:
+        print("\n【3】Region hrew 区分度 (采样)")
+        step = max(1, len(hrew_spread) // 8)
+        print(f"  {'seed#':>7} {'regs':>5} {'spread':>8} {'max':>8} {'min':>8} {'H(p)':>8}")
+        for i in range(0, len(hrew_spread), step):
+            s = hrew_spread[i]
+            print(f"  {i:>7} {s['num_regions']:>5} {s['spread']:>8.4f} {s['max']:>8.4f} {s['min']:>8.4f} {s['entropy']:>8.4f}")
+        arr = np.array([x['spread'] for x in hrew_spread])
+        print(f"\n  平均 spread: {arr.mean():.4f}  中位: {np.median(arr):.4f}  最大: {arr.max():.4f}")
 
     print(f"\n{'='*60}\n")
 
@@ -215,5 +124,5 @@ if __name__ == '__main__':
     if len(sys.argv) < 2:
         print("用法: python analyze_bandit.py <bandit_log文件>")
         sys.exit(1)
-    seeds = parse_log(sys.argv[1])
-    analyze(seeds)
+    main(sys.argv[1])
+
