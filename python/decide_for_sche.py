@@ -46,7 +46,7 @@ logging.basicConfig(
 logging.info("Python程序启动")
 
 class LinTSScheduler:
-    FAMILY_PRIOR_STRENGTH = 0.25
+    FAMILY_PRIOR_STRENGTH = 150.0
 
     def __init__(self, num_regions=MAX_REGIONS, num_families=5,
                  v=0.5, lambda_reg=1.0, temperature=1.0,
