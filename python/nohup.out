@@ -1,1 +1,9 @@
 total 0 
+Traceback (most recent call last):
+  File "decide_for_sche.py", line 543, in <module>
+    main()
+  File "decide_for_sche.py", line 512, in main
+    scheduler.get_distributions(global_ctx, regions_ctx_list, num_regions)
+  File "decide_for_sche.py", line 140, in get_distributions
+    P_reg_given_fam[f] = self._softmax(reg_scores, valid_mask)
+ValueError: could not broadcast input array from shape (16,) into shape (1,)

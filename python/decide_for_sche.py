@@ -1,5 +1,5 @@
 """
-python端作为决策大脑，做这几件事情：
+3302413python端作为决策大脑，做这几件事情：
     1. 等待AFL那边传输数据
     2. 保存数据到结构体，处理成特征
     3. 用这次的特征和上一次的reward更新决策，选择Region
@@ -19,7 +19,7 @@ import random
 import numpy as np
 
 MAX_REGIONS = 16
-INIT_REGIONS = 4
+INIT_REGIONS = 1
 NUM_FAMILY = 5
 MAX_BATCH_FEEDBACKS = 64
 MAX_ZERO_PER_FAMILY = 1
@@ -46,7 +46,7 @@ logging.basicConfig(
 logging.info("Python程序启动")
 
 class LinTSScheduler:
-    FAMILY_PRIOR_STRENGTH = 150.0
+    FAMILY_PRIOR_STRENGTH = 1000.0
 
     def __init__(self, num_regions=MAX_REGIONS, num_families=5,
                  v=0.5, lambda_reg=1.0, temperature=1.0,
@@ -103,8 +103,8 @@ class LinTSScheduler:
         return cov
 
     def get_distributions(self, global_ctx, regions_ctx_list, num_regions):
-        valid_mask = np.array([np.any(np.abs(r) > 1e-12)
-                               for r in regions_ctx_list], dtype=bool)
+        valid_mask = np.array([np.any(np.abs(regions_ctx_list[i]) > 1e-12)
+                               for i in range(num_regions)], dtype=bool)
 
         x_fam = np.asarray(global_ctx, dtype=np.float64)
 
@@ -164,36 +164,53 @@ class LinTSScheduler:
         mean_avg_reward = float(np.mean(avg_reward))
         return self.FAMILY_PRIOR_STRENGTH * (avg_reward - mean_avg_reward)
 
-    def update(self, best_family, best_region, x_fam, x_all, reward):
-        """单条成功反馈更新 posterior。"""
+    def update_region(self, best_family, best_region, x_all, reward):
+        """单条正反馈更新 region posterior。"""
         if best_family == -1 or best_region == -1:
             return
         if not (0 <= best_family < self.num_families):
-            logging.warning(f"[PY][UPDATE] 非法 best_family={best_family}")
             return
         if not (0 <= best_region < self.num_regions) or x_all[best_region] is None:
-            logging.warning(f"[PY][UPDATE] best_region={best_region} 无效")
             return
 
         gamma = self.forgetting
-
-        # Family 模型更新 (只更新被选中的 family)
-        self.A_fam[best_family] = (gamma * self.A_fam[best_family]
-                                   + np.outer(x_fam, x_fam))
-        self.b_fam[best_family] = (gamma * self.b_fam[best_family]
-                                   + reward * x_fam)
-
-        # Region-在-family 下的模型更新
         x_r = x_all[best_region]
         self.A_reg[best_family] = (gamma * self.A_reg[best_family]
                                    + np.outer(x_r, x_r))
         self.b_reg[best_family] = (gamma * self.b_reg[best_family]
                                    + reward * x_r)
 
+    def update_family_model(self, x_fam, feedbacks, family_trials):
+        """每 batch 聚合更新 family posterior，每个 family 最多 1 次 update。
+        reward = 该 family 本 batch 的 total_reward / positive_count，
+        只除以有正反馈的次数，避免大量零 trial 稀释信号。"""
+        gamma = self.forgetting
+
+        fam_reward = np.zeros(self.num_families)
+        fam_positive_count = np.zeros(self.num_families, dtype=int)
+        for reward, _, family in feedbacks:
+            if 0 <= family < self.num_families:
+                fam_reward[family] += reward
+                fam_positive_count[family] += 1
+
+        updated = []
+        for f in range(self.num_families):
+            trials = max(int(family_trials[f]), 0) if f < len(family_trials) else 0
+            if trials <= 0:
+                continue
+            pos_count = fam_positive_count[f]
+            if pos_count <= 0:
+                avg_r = 0.0
+            else:
+                avg_r = fam_reward[f] / pos_count
+            self.A_fam[f] = gamma * self.A_fam[f] + np.outer(x_fam, x_fam)
+            self.b_fam[f] = gamma * self.b_fam[f] + avg_r * x_fam
+            updated.append((f, avg_r, pos_count, trials))
+
         self.update_count += 1
-        avg_reward = self.family_reward_sum[best_family] / max(self.family_trial_sum[best_family], 1.0)
-        logging.info(f"[PY][UPDATE] reward={reward:.4f} best_f={best_family} "
-                     f"best_r={best_region} avg_reward={avg_reward:.4f} (t={self.update_count})")
+        if updated:
+            parts = [f"f{f}:{avg_r:.4f}({p}pos/{t}t)" for f, avg_r, p, t in updated]
+            logging.info(f"[PY][FAM_UPDATE] {' '.join(parts)} (t={self.update_count})")
 
 
 class RegionManager:
@@ -255,9 +272,14 @@ class RegionManager:
         return changed
 
     def _try_split(self):
-        """找 reward 方差最大的 region 分裂"""
+        """找 reward 方差最大的 region 分裂。
+        阈值随粒度自适应：粗分区天然方差低（空间平均效应），
+        按 num_regions/max_regions 缩放，保证粗粒度时充分探索。
+        """
         if self.num_regions >= self.max_regions:
             return False
+
+        adaptive_thresh = self.SPLIT_VAR_THRESH * (self.num_regions / self.max_regions)
 
         best_idx = -1
         best_var = 0.0
@@ -269,7 +291,7 @@ class RegionManager:
             if (r_end - r_start) < self.MIN_REGION_BYTES * 2:
                 continue
             var = np.var(hist)
-            if var > self.SPLIT_VAR_THRESH and var > best_var:
+            if var > adaptive_thresh and var > best_var:
                 best_var = var
                 best_idx = i
 
@@ -278,16 +300,16 @@ class RegionManager:
 
         s, e = self.bounds[best_idx]
         mid = (s + e) // 2
-        parent_hist = self.reward_history[best_idx]
 
         self.bounds[best_idx] = (s, mid)
         self.bounds.insert(best_idx + 1, (mid, e))
 
-        self.reward_history[best_idx] = list(parent_hist)
-        self.reward_history.insert(best_idx + 1, list(parent_hist))
+        self.reward_history[best_idx] = []
+        self.reward_history.insert(best_idx + 1, [])
 
         self.num_regions += 1
         logging.info(f"[REGION][SPLIT] idx={best_idx} var={best_var:.4f} "
+                     f"thresh={adaptive_thresh:.4f} "
                      f"[{s},{e}) -> [{s},{mid}) + [{mid},{e})")
         return True
 
@@ -332,16 +354,6 @@ class RegionManager:
                      f"-> [{s1},{e2})")
         return True
 
-
-def write_bounds_to_shm(c2py_map, num_regions, bounds):
-    """将更新后的 region bounds 写回共享内存头部"""
-    c2py_map.seek(0)
-    c2py_map.write(struct.pack('<i', num_regions))
-    for s, e in bounds:
-        c2py_map.write(struct.pack('<2I', s, e))
-    for _ in range(MAX_REGIONS - len(bounds)):
-        c2py_map.write(struct.pack('<2I', 0, 0))
-    c2py_map.flush()
 
 
 def init_ipc():
@@ -391,12 +403,14 @@ def wait_for_afl_features():
 
 
 def write_decision_to_shm(py2c_map, P_fam: np.ndarray,
-                          P_reg_given_fam: np.ndarray, num_regions: int):
+                          P_reg_given_fam: np.ndarray, num_regions: int,
+                          bounds: list):
     """
-    布局(family → region):
+    布局(family → region → bounds):
     [0:40]    P_fam             : 5 个 double
     [40:680]  P_reg_given_fam   : 5×MAX_REGIONS 个 double, 按 family 行主序
-    num_regions < MAX_REGIONS 时，补零填满
+    [680:684] num_regions       : 1 个 int
+    [684:812] bounds[16][2]     : 16×2 个 int (start, end)
     """
     full_P_reg = np.zeros((NUM_FAMILY, MAX_REGIONS), dtype=np.float64)
     full_P_reg[:, :num_regions] = P_reg_given_fam
@@ -404,11 +418,18 @@ def write_decision_to_shm(py2c_map, P_fam: np.ndarray,
     py2c_map.seek(0)
     py2c_map.write(P_fam.astype('<f8').tobytes())
     py2c_map.write(full_P_reg.astype('<f8').flatten().tobytes())
+
+    py2c_map.write(struct.pack('<i', num_regions))
+    for s, e in bounds:
+        py2c_map.write(struct.pack('<2i', s, e))
+    for _ in range(MAX_REGIONS - len(bounds)):
+        py2c_map.write(struct.pack('<2i', 0, 0))
     py2c_map.flush()
 
     logging.info(f"[PY][SEND] P_fam={np.round(P_fam, 3).tolist()}")
     best_f = int(np.argmax(P_fam))
     logging.info(f"[PY][SEND] best_f={best_f} num_regions={num_regions} "
+                 f"bounds={bounds[:num_regions]} "
                  f"P_reg|f={best_f}={np.round(P_reg_given_fam[best_f], 3).tolist()}")
     
 
@@ -419,15 +440,16 @@ def wake_up_afl():
 
 
 def read_features_from_shm() -> tuple:
-    """固定 16 region 布局：直接读 global_ctx + regions_ctx"""
+    """读 global_ctx + regions_ctx，global_ctx[0] 是归一化的 seed_len"""
     c2py_map.seek(0)
     global_ctx = np.frombuffer(c2py_map.read(3 * 8), dtype='<f8').copy().astype(np.float32)
+    seed_len = int(round(global_ctx[0] * 10000))
 
     all_region_data = np.frombuffer(c2py_map.read(MAX_REGIONS * 4 * 8), dtype='<f8').copy()
     regions_matrix = all_region_data.reshape(MAX_REGIONS, 4).astype(np.float32)
     regions_ctx_list = [regions_matrix[i] for i in range(MAX_REGIONS)]
 
-    return MAX_REGIONS, global_ctx, regions_ctx_list
+    return seed_len, global_ctx, regions_ctx_list
 
 
 def read_batch_feedbacks(c2py_map):
@@ -476,22 +498,37 @@ def main():
     global c2py_map, py2c_map
     init_ipc()
 
+    region_mgr = RegionManager(max_regions=MAX_REGIONS, init_regions=INIT_REGIONS)
+
     scheduler = LinTSScheduler(
-        num_regions=MAX_REGIONS, num_families=5,
-        v=0.2,                # 后验采样方差缩放，控制探索幅度
-        lambda_reg=1.0,       # ridge 正则
-        temperature=0.5,      # softmax 温度
-        forgetting=0.999,     # 遗忘因子
-        epsilon=0.03,         # 3% 保底均匀探索
+        num_regions=INIT_REGIONS, num_families=5,
+        v=0.05,
+        lambda_reg=1.0,
+        temperature=0.1,
+        forgetting=1.0,
+        epsilon=0.01,
     )
 
-    logging.info("===== LinTS Scheduler (family→region) 启动 =====")
+    logging.info("===== LinTS Scheduler (family→region, adaptive) 启动 =====")
     logging.info(f"[PY][CONFIG] v={scheduler.v} temp={scheduler.temperature} "
-                 f"forget={scheduler.forgetting} eps={scheduler.epsilon}")
+                 f"forget={scheduler.forgetting} eps={scheduler.epsilon} "
+                 f"init_regions={INIT_REGIONS}")
+
+    bounds_initialized = False
 
     while True:
         wait_for_afl_features()
-        num_regions, global_ctx, regions_ctx_list = read_features_from_shm()
+        seed_len, global_ctx, regions_ctx_list = read_features_from_shm()
+
+        if not bounds_initialized and seed_len > 0:
+            region_mgr.init_bounds(seed_len)
+            bounds_initialized = True
+            logging.info(f"[PY][REGION] init bounds seed_len={seed_len} "
+                         f"num_regions={region_mgr.num_regions} "
+                         f"bounds={region_mgr.bounds}")
+
+        num_regions = region_mgr.num_regions
+        scheduler.num_regions = num_regions
 
         P_fam, P_reg_given_fam, valid_mask, x_fam, x_all = \
             scheduler.get_distributions(global_ctx, regions_ctx_list, num_regions)
@@ -499,21 +536,27 @@ def main():
         P_fam, P_reg_given_fam = scheduler.apply_epsilon(
             P_fam, P_reg_given_fam, valid_mask)
 
-        write_decision_to_shm(py2c_map, P_fam, P_reg_given_fam, num_regions)
+        write_decision_to_shm(py2c_map, P_fam, P_reg_given_fam,
+                              num_regions, region_mgr.bounds)
         wake_up_afl()
 
         wait_for_afl_finish_batch()
         feedbacks, family_trials = read_batch_feedbacks(c2py_map)
         update_family_trials(scheduler, family_trials, feedbacks)
 
-        logging.info(f"[PY][BATCH_DONE] num_feedbacks={len(feedbacks)} "
-                     f"num_regions={num_regions} family_trials={family_trials}")
+        region_mgr.record_rewards(feedbacks, num_regions)
+        if region_mgr.maybe_adapt():
+            logging.info(f"[PY][REGION] adapted num_regions={region_mgr.num_regions} "
+                         f"bounds={region_mgr.bounds}")
 
+        logging.info(f"[PY][BATCH_DONE] num_feedbacks={len(feedbacks)} "
+                     f"num_regions={region_mgr.num_regions} family_trials={family_trials}")
+
+        scheduler.update_family_model(x_fam, feedbacks, family_trials)
         for reward, region, family in feedbacks:
-            scheduler.update(
+            scheduler.update_region(
                 best_family=family,
                 best_region=region,
-                x_fam=x_fam,
                 x_all=x_all,
                 reward=reward,
             )
